@@ -1,0 +1,167 @@
+{
+    "general": {
+        "language": "ar",
+        "start_minimized": true,
+        "show_in_taskbar": false,
+        "enable_logging": false
+    },
+    "reminder": {
+        "enabled": true,
+        "interval_minutes": 60,
+        "random_order": true,
+        "show_virtue": true,
+        "quiet_hours": {
+            "enabled": false,
+            "start": "23:00",
+            "end": "06:00"
+        }
+    },
+    "surah_reminder": {
+        "enabled": true,
+        "interval_days": 3,
+        "last_shown": null
+    },
+    "morning_evening": {
+        "enabled": true,
+        "morning_time": "06:00",
+        "evening_time": "18:00"
+    },
+    "popup": {
+        "theme": "cyberpunk_dark",
+        "position": "bottom_right",
+        "width": 450,
+        "height": 200,
+        "duration_seconds": 8,
+        "font_family": "Amiri",
+        "font_size": 18,
+        "animation": "fade",
+        "opacity": 0.95,
+        "border_radius": 15
+    },
+    "sound": {
+        "enabled": true,
+        "volume": 0.3,
+        "sound_file": "soft_chime.wav"
+    },
+    "statistics": {
+        "enabled": true,
+        "daily_count": 0,
+        "total_count": 0,
+        "last_reset": null
+    },
+    "themes": {
+        "cyberpunk_dark": {
+            "name": "سايبربنك داكن",
+            "background": "#0a0a0f",
+            "background_gradient": "linear-gradient(135deg, #0a0a0f 0%, #1a1a2e 50%, #0f0f1a 100%)",
+            "text_color": "#00ffff",
+            "accent_color": "#ff00ff",
+            "secondary_color": "#00ff88",
+            "border_color": "#00ffff",
+            "glow_color": "#00ffff",
+            "font_family": "Amiri"
+        },
+        "cyberpunk_neon": {
+            "name": "نيون متوهج",
+            "background": "#0d0221",
+            "background_gradient": "linear-gradient(135deg, #0d0221 0%, #150734 50%, #0d0221 100%)",
+            "text_color": "#f72585",
+            "accent_color": "#7209b7",
+            "secondary_color": "#4cc9f0",
+            "border_color": "#f72585",
+            "glow_color": "#f72585",
+            "font_family": "Amiri"
+        },
+        "islamic_gold": {
+            "name": "ذهبي إسلامي",
+            "background": "#1a1a2e",
+            "background_gradient": "linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f0f23 100%)",
+            "text_color": "#ffd700",
+            "accent_color": "#daa520",
+            "secondary_color": "#f4e4bc",
+            "border_color": "#ffd700",
+            "glow_color": "#ffd700",
+            "font_family": "Amiri"
+        },
+        "ocean_depth": {
+            "name": "أعماق المحيط",
+            "background": "#0c1821",
+            "background_gradient": "linear-gradient(135deg, #0c1821 0%, #1b2838 50%, #0c1821 100%)",
+            "text_color": "#4fc3f7",
+            "accent_color": "#0288d1",
+            "secondary_color": "#81d4fa",
+            "border_color": "#4fc3f7",
+            "glow_color": "#4fc3f7",
+            "font_family": "Amiri"
+        },
+        "emerald_night": {
+            "name": "ليل زمردي",
+            "background": "#0a1612",
+            "background_gradient": "linear-gradient(135deg, #0a1612 0%, #1a2f28 50%, #0a1612 100%)",
+            "text_color": "#50fa7b",
+            "accent_color": "#00d26a",
+            "secondary_color": "#98fb98",
+            "border_color": "#50fa7b",
+            "glow_color": "#50fa7b",
+            "font_family": "Amiri"
+        },
+        "royal_purple": {
+            "name": "بنفسجي ملكي",
+            "background": "#1a0a2e",
+            "background_gradient": "linear-gradient(135deg, #1a0a2e 0%, #2d1b4e 50%, #1a0a2e 100%)",
+            "text_color": "#bb86fc",
+            "accent_color": "#9c27b0",
+            "secondary_color": "#e1bee7",
+            "border_color": "#bb86fc",
+            "glow_color": "#bb86fc",
+            "font_family": "Amiri"
+        },
+        "sunset_warm": {
+            "name": "غروب دافئ",
+            "background": "#1a0f0a",
+            "background_gradient": "linear-gradient(135deg, #1a0f0a 0%, #2d1810 50%, #1a0f0a 100%)",
+            "text_color": "#ff7043",
+            "accent_color": "#ff5722",
+            "secondary_color": "#ffab91",
+            "border_color": "#ff7043",
+            "glow_color": "#ff7043",
+            "font_family": "Amiri"
+        },
+        "minimal_white": {
+            "name": "أبيض بسيط",
+            "background": "#ffffff",
+            "background_gradient": "linear-gradient(135deg, #ffffff 0%, #f5f5f5 50%, #ffffff 100%)",
+            "text_color": "#1a1a1a",
+            "accent_color": "#2196f3",
+            "secondary_color": "#757575",
+            "border_color": "#e0e0e0",
+            "glow_color": "#2196f3",
+            "font_family": "Amiri"
+        }
+    },
+    "available_sounds": [
+        {"id": "soft_chime", "name": "رنين ناعم", "file": "soft_chime.wav"},
+        {"id": "water_drop", "name": "قطرة ماء", "file": "water_drop.wav"},
+        {"id": "gentle_bell", "name": "جرس هادئ", "file": "gentle_bell.wav"},
+        {"id": "wind_chime", "name": "أجراس الرياح", "file": "wind_chime.wav"},
+        {"id": "none", "name": "بدون صوت", "file": null}
+    ],
+    "positions": [
+        {"id": "top_left", "name": "أعلى اليسار"},
+        {"id": "top_right", "name": "أعلى اليمين"},
+        {"id": "top_center", "name": "أعلى الوسط"},
+        {"id": "bottom_left", "name": "أسفل اليسار"},
+        {"id": "bottom_right", "name": "أسفل اليمين"},
+        {"id": "bottom_center", "name": "أسفل الوسط"},
+        {"id": "center", "name": "وسط الشاشة"}
+    ],
+    "animations": [
+        {"id": "fade", "name": "تلاشي"},
+        {"id": "slide_up", "name": "انزلاق للأعلى"},
+        {"id": "slide_down", "name": "انزلاق للأسفل"},
+        {"id": "slide_left", "name": "انزلاق لليسار"},
+        {"id": "slide_right", "name": "انزلاق لليمين"},
+        {"id": "zoom", "name": "تكبير"},
+        {"id": "bounce", "name": "ارتداد"}
+    ]
+}

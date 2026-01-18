@@ -1,0 +1,38 @@
+{
+  "reminder": {
+    "enabled": true,
+    "interval_minutes": 60,
+    "random_order": true,
+    "show_virtue": true,
+    "quiet_hours": {
+      "enabled": false,
+      "start": "23:00",
+      "end": "06:00"
+    }
+  },
+  "surah_reminder": {
+    "enabled": true,
+    "interval_days": 3,
+    "last_shown": "2026-01-18T17:40:52.154884"
+  },
+  "popup": {
+    "theme": "islamic_gold",
+    "position": "bottom_right",
+    "width": 450,
+    "height": 220,
+    "duration_seconds": 8,
+    "font_size": 20,
+    "opacity": 0.95,
+    "border_radius": 15
+  },
+  "sound": {
+    "enabled": true,
+    "volume": 30
+  },
+  "stats": {
+    "daily_count": 1,
+    "total_count": 1,
+    "last_reset": "2026-01-18"
+  },
+  "custom_athkar": []
+}
