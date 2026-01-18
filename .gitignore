@@ -7,3 +7,20 @@ venv/
 .DS_Store
 .idea/
 .vscode/
+
+# Build artifacts
+build/
+dist/
+*.spec.bak
+
+# User-specific data
+data/user_settings.json
+
+# Frontend (separate project)
+frontend/
+
+# Claude Code settings
+.claude/
+
+# Other
+nul

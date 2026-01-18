@@ -15,8 +15,64 @@ import os
 import json
 import random
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+import winreg
+import tempfile
+import atexit
+import msvcrt
+
+# Timezone support
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    # Fallback for Python < 3.9
+    try:
+        from backports.zoneinfo import ZoneInfo
+    except ImportError:
+        # If no timezone library available, create a simple UTC offset class
+        class ZoneInfo:
+            def __init__(self, tz_string):
+                # Simple UTC+3 implementation as fallback
+                self.offset = timedelta(hours=3)
+                self.name = tz_string
+
+            def utcoffset(self, dt):
+                return self.offset
+
+            def tzname(self, dt):
+                return self.name
+
+            def dst(self, dt):
+                return timedelta(0)
+
+# ============================================
+# Single Instance Lock
+# ============================================
+
+_lock_file = None
+
+def acquire_single_instance_lock():
+    """Prevent multiple instances from running"""
+    global _lock_file
+    lock_path = Path(tempfile.gettempdir()) / "thikr_instance.lock"
+    try:
+        _lock_file = open(lock_path, 'w')
+        msvcrt.locking(_lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+        atexit.register(release_lock)
+        return True
+    except (OSError, IOError):
+        return False
+
+def release_lock():
+    """Release the single instance lock"""
+    global _lock_file
+    if _lock_file:
+        try:
+            msvcrt.locking(_lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+            _lock_file.close()
+        except:
+            pass
 
 # التحقق من المتطلبات
 try:
@@ -37,27 +93,146 @@ try:
         QPen, QRadialGradient, QAction, QCursor,
         QFontDatabase, QGuiApplication
     )
-except ImportError:
-    print("جاري تثبيت PyQt6...")
-    os.system(f"{sys.executable} -m pip install PyQt6 --break-system-packages -q")
-    from PyQt6.QtWidgets import *
-    from PyQt6.QtCore import *
-    from PyQt6.QtGui import *
+except ImportError as e:
+    # In compiled executable, dependencies are bundled
+    # Show a simple error and exit gracefully
+    import ctypes
+    ctypes.windll.user32.MessageBoxW(
+        0, 
+        "خطأ: المكتبات المطلوبة غير موجودة\n\nError: Required libraries not found\n\n" + str(e), 
+        "ذِكْر - خطأ", 
+        0x10  # MB_ICONERROR
+    )
+    sys.exit(1)
 
 
 # ============================================
 # الثوابت والمسارات
 # ============================================
 
+def get_base_path():
+    """الحصول على المسار الأساسي للتطبيق - يدعم التجميع والتطوير"""
+    if getattr(sys, 'frozen', False):
+        # تشغيل من ملف مجمّع (PyInstaller)
+        return Path(sys.executable).parent
+    return Path(__file__).parent.resolve()
+
+def get_appdata_path():
+    """الحصول على مسار AppData لحفظ بيانات المستخدم"""
+    # استخدام متغير البيئة APPDATA (أكثر موثوقية)
+    appdata = os.environ.get('APPDATA')
+    if appdata:
+        return Path(appdata) / "Thikr"
+    
+    # Fallback: استخدام مجلد المستخدم
+    try:
+        return Path.home() / "AppData" / "Roaming" / "Thikr"
+    except Exception:
+        # Fallback نهائي: المجلد الحالي
+        return get_base_path() / "data"
+
 APP_NAME = "ذِكْر"
 APP_VERSION = "1.0.0"
-APP_DIR = Path(__file__).parent.resolve()
-DATA_DIR = APP_DIR / "data"
+APP_DIR = get_base_path()
+
+# بيانات المستخدم في AppData (تبقى عند تحديث التطبيق)
+DATA_DIR = get_appdata_path()
+
+# لا نحتاج مجلد sounds منفصل في النسخة المجمّعة
 SOUNDS_DIR = APP_DIR / "sounds"
 
-# إنشاء المجلدات
-for directory in [DATA_DIR, SOUNDS_DIR]:
-    directory.mkdir(parents=True, exist_ok=True)
+# إنشاء مجلد البيانات مع معالجة الأخطاء
+def ensure_data_directory():
+    """التأكد من وجود مجلد البيانات"""
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        return True
+    except PermissionError:
+        print(f"تحذير: لا يمكن إنشاء مجلد البيانات في {DATA_DIR}")
+        return False
+    except Exception as e:
+        print(f"خطأ غير متوقع: {e}")
+        return False
+
+# إنشاء المجلدات عند بدء التشغيل
+ensure_data_directory()
+
+
+# ============================================
+# Timezone Helper Functions
+# ============================================
+
+def get_app_timezone(tz_string="UTC+3"):
+    """Get the application timezone (default UTC+3)"""
+    try:
+        # Try to parse custom UTC offset format
+        if tz_string.startswith("UTC"):
+            offset_str = tz_string[3:]  # Remove 'UTC' prefix
+            if offset_str:
+                sign = 1 if offset_str[0] == '+' else -1
+                hours = int(offset_str[1:]) if len(offset_str) > 1 else 0
+                offset = timedelta(hours=sign * hours)
+                return timezone(offset, name=tz_string)
+        # For standard timezone names, use ZoneInfo
+        return ZoneInfo(tz_string)
+    except:
+        # Fallback to UTC+3
+        return timezone(timedelta(hours=3), name="UTC+3")
+
+
+def get_now(tz_string="UTC+3"):
+    """Get current datetime with timezone awareness"""
+    tz = get_app_timezone(tz_string)
+    return datetime.now(tz)
+
+
+# ============================================
+# وظائف التشغيل التلقائي (Windows Registry)
+# ============================================
+
+def get_autostart_enabled():
+    """التحقق من تفعيل التشغيل التلقائي"""
+    try:
+        key = winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Run",
+            0, winreg.KEY_READ
+        )
+        try:
+            winreg.QueryValueEx(key, "Thikr")
+            winreg.CloseKey(key)
+            return True
+        except FileNotFoundError:
+            winreg.CloseKey(key)
+            return False
+    except Exception:
+        return False
+
+def set_autostart_enabled(enable: bool):
+    """تفعيل/إلغاء التشغيل التلقائي باستخدام Registry"""
+    try:
+        key = winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Run",
+            0, winreg.KEY_SET_VALUE
+        )
+        if enable:
+            # استخدام المسار الكامل للتطبيق
+            if getattr(sys, 'frozen', False):
+                exe_path = sys.executable
+            else:
+                exe_path = f'"{sys.executable}" "{Path(__file__).resolve()}"'
+            winreg.SetValueEx(key, "Thikr", 0, winreg.REG_SZ, exe_path)
+        else:
+            try:
+                winreg.DeleteValue(key, "Thikr")
+            except FileNotFoundError:
+                pass
+        winreg.CloseKey(key)
+        return True
+    except Exception as e:
+        print(f"Autostart error: {e}")
+        return False
 
 
 # ============================================
@@ -292,7 +467,7 @@ class SettingsManager:
         defaults = {
             "reminder": {
                 "enabled": True,
-                "interval_minutes": 60,
+                "interval_minutes": 1,  # Default to 1 minute
                 "random_order": True,
                 "show_virtue": True,
                 "quiet_hours": {"enabled": False, "start": "23:00", "end": "06:00"}
@@ -321,6 +496,7 @@ class SettingsManager:
                 "total_count": 0,
                 "last_reset": None
             },
+            "timezone": "UTC+3",  # Default timezone
             "custom_athkar": []
         }
         
@@ -379,16 +555,214 @@ class SettingsManager:
         return random.choice(DEFAULT_SURAHS) if DEFAULT_SURAHS else None
     
     def increment_counter(self):
-        today = datetime.now().strftime("%Y-%m-%d")
+        tz = self.get('timezone', 'UTC+3')
+        today = get_now(tz).strftime("%Y-%m-%d")
         if self.get('stats.last_reset') != today:
             self.set('stats.daily_count', 0)
             self.set('stats.last_reset', today)
-        
+
         daily = self.get('stats.daily_count', 0) + 1
         total = self.get('stats.total_count', 0) + 1
         self.set('stats.daily_count', daily)
         self.set('stats.total_count', total)
         return daily, total
+
+
+# ============================================
+# نافذة الإعداد الأول (First Run)
+# ============================================
+
+class FirstRunDialog(QWidget):
+    """نافذة ترحيبية تظهر عند التشغيل الأول"""
+    setup_complete = pyqtSignal(bool)  # True = enable autostart
+    
+    def __init__(self):
+        super().__init__(None, Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setFixedSize(450, 350)
+        self.setup_ui()
+        self.center_on_screen()
+        
+        # Animation timer
+        self.progress_value = 0
+        self.progress_timer = QTimer(self)
+        self.progress_timer.timeout.connect(self.update_progress)
+    
+    def setup_ui(self):
+        # Main container with beautiful styling
+        self.container = QFrame(self)
+        self.container.setGeometry(0, 0, 450, 350)
+        self.container.setObjectName("container")
+        
+        layout = QVBoxLayout(self.container)
+        layout.setContentsMargins(30, 30, 30, 30)
+        layout.setSpacing(15)
+        
+        # Title with moon emoji
+        title = QLabel("🌙 ذِكْر")
+        title.setObjectName("title")
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        
+        # Welcome message
+        welcome = QLabel("مرحباً بك في برنامج التذكير بذكر الله")
+        welcome.setObjectName("welcome")
+        welcome.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        welcome.setWordWrap(True)
+        
+        # Progress container
+        progress_container = QFrame()
+        progress_layout = QVBoxLayout(progress_container)
+        progress_layout.setContentsMargins(0, 20, 0, 10)
+        
+        self.progress = QProgressBar()
+        self.progress.setObjectName("progress")
+        self.progress.setTextVisible(False)
+        self.progress.setFixedHeight(8)
+        self.progress.setMaximum(100)
+        self.progress.setValue(0)
+        
+        self.status_label = QLabel("جاري تهيئة البرنامج...")
+        self.status_label.setObjectName("status")
+        self.status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        
+        progress_layout.addWidget(self.progress)
+        progress_layout.addWidget(self.status_label)
+        
+        # Autostart checkbox (default checked)
+        self.autostart_cb = QCheckBox("تشغيل البرنامج مع بدء Windows")
+        self.autostart_cb.setObjectName("checkbox")
+        self.autostart_cb.setChecked(True)
+        self.autostart_cb.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
+        
+        # Start button (hidden initially)
+        self.start_btn = QPushButton("ابدأ الآن")
+        self.start_btn.setObjectName("startBtn")
+        self.start_btn.setFixedHeight(45)
+        self.start_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.start_btn.clicked.connect(self.on_start_clicked)
+        self.start_btn.setVisible(False)
+        
+        layout.addWidget(title)
+        layout.addWidget(welcome)
+        layout.addWidget(progress_container)
+        layout.addWidget(self.autostart_cb)
+        layout.addStretch()
+        layout.addWidget(self.start_btn)
+        
+        self.apply_style()
+        
+        # Add glow effect
+        glow = QGraphicsDropShadowEffect(self)
+        glow.setBlurRadius(30)
+        glow.setColor(QColor("#00ffff"))
+        glow.setOffset(0, 0)
+        self.container.setGraphicsEffect(glow)
+    
+    def apply_style(self):
+        self.setStyleSheet("""
+            #container {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:1, 
+                    stop:0 #0a0a0f, stop:0.5 #1a1a2e, stop:1 #0f0f1a);
+                border: 2px solid #00ffff;
+                border-radius: 20px;
+            }
+            #title {
+                color: #00ffff;
+                font-size: 36px;
+                font-weight: bold;
+                padding: 10px;
+            }
+            #welcome {
+                color: #ffffff;
+                font-size: 18px;
+                padding: 5px;
+            }
+            #progress {
+                background: rgba(255,255,255,0.1);
+                border: none;
+                border-radius: 4px;
+            }
+            #progress::chunk {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #00ffff, stop:1 #ff00ff);
+                border-radius: 4px;
+            }
+            #status {
+                color: #00ff88;
+                font-size: 14px;
+            }
+            #checkbox {
+                color: #ffffff;
+                font-size: 15px;
+                spacing: 10px;
+            }
+            #checkbox::indicator {
+                width: 20px;
+                height: 20px;
+            }
+            #checkbox::indicator:unchecked {
+                border: 2px solid #00ffff;
+                border-radius: 4px;
+                background: transparent;
+            }
+            #checkbox::indicator:checked {
+                border: 2px solid #00ffff;
+                border-radius: 4px;
+                background: #00ffff;
+            }
+            #startBtn {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #00ffff, stop:1 #00ff88);
+                color: #000000;
+                font-size: 18px;
+                font-weight: bold;
+                border: none;
+                border-radius: 10px;
+            }
+            #startBtn:hover {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #00ff88, stop:1 #00ffff);
+            }
+        """)
+    
+    def center_on_screen(self):
+        screen = QGuiApplication.primaryScreen().geometry()
+        x = (screen.width() - self.width()) // 2
+        y = (screen.height() - self.height()) // 2
+        self.move(x, y)
+    
+    def start_setup(self):
+        self.show()
+        self.progress_timer.start(30)  # Fast animation
+    
+    def update_progress(self):
+        self.progress_value += 2
+        self.progress.setValue(min(100, self.progress_value))
+        
+        # Update status text at different stages
+        if self.progress_value == 30:
+            self.status_label.setText("جاري تحميل الأذكار...")
+        elif self.progress_value == 60:
+            self.status_label.setText("جاري إعداد الواجهة...")
+        elif self.progress_value == 90:
+            self.status_label.setText("جاهز! ✓")
+        
+        if self.progress_value >= 100:
+            self.progress_timer.stop()
+            self.start_btn.setVisible(True)
+    
+    def on_start_clicked(self):
+        enable_autostart = self.autostart_cb.isChecked()
+        self.setup_complete.emit(enable_autostart)
+        self.close()
+    
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            self.drag_pos = e.globalPosition().toPoint() - self.frameGeometry().topLeft()
+    
+    def mouseMoveEvent(self, e):
+        if e.buttons() == Qt.MouseButton.LeftButton and hasattr(self, 'drag_pos'):
+            self.move(e.globalPosition().toPoint() - self.drag_pos)
 
 
 # ============================================
@@ -625,12 +999,13 @@ class ReminderThread(QThread):
                         surah = self.settings.get_random_surah()
                         if surah:
                             self.show_reminder.emit(surah, True)
-                            self.settings.set('surah_reminder.last_shown', datetime.now().isoformat())
+                            tz = self.settings.get('timezone', 'UTC+3')
+                            self.settings.set('surah_reminder.last_shown', get_now(tz).isoformat())
                     else:
                         thikr = self.settings.get_random_thikr()
                         self.show_reminder.emit(thikr, False)
-            
-            interval = self.settings.get('reminder.interval_minutes', 60) * 60
+
+            interval = self.settings.get('reminder.interval_minutes', 1) * 60
             for _ in range(interval):
                 if not self.running:
                     break
@@ -640,11 +1015,12 @@ class ReminderThread(QThread):
         q = self.settings.get('reminder.quiet_hours', {})
         if not q.get('enabled'):
             return False
-        
-        now = datetime.now().time()
+
+        tz = self.settings.get('timezone', 'UTC+3')
+        now = get_now(tz).time()
         start = datetime.strptime(q.get('start', '23:00'), '%H:%M').time()
         end = datetime.strptime(q.get('end', '06:00'), '%H:%M').time()
-        
+
         if start <= end:
             return start <= now <= end
         return now >= start or now <= end
@@ -652,15 +1028,23 @@ class ReminderThread(QThread):
     def should_show_surah(self):
         if not self.settings.get('surah_reminder.enabled', True):
             return False
-        
+
         last = self.settings.get('surah_reminder.last_shown')
         if not last:
             return True
-        
+
         try:
             last_date = datetime.fromisoformat(last)
+            tz = self.settings.get('timezone', 'UTC+3')
+            now = get_now(tz)
+
+            # Make last_date timezone-aware if it isn't already
+            if last_date.tzinfo is None:
+                tz_obj = get_app_timezone(tz)
+                last_date = last_date.replace(tzinfo=tz_obj)
+
             days = self.settings.get('surah_reminder.interval_days', 3)
-            return datetime.now() - last_date >= timedelta(days=days)
+            return now - last_date >= timedelta(days=days)
         except:
             return True
     
@@ -672,6 +1056,39 @@ class ReminderThread(QThread):
     
     def resume(self):
         self.paused = False
+
+
+# ============================================
+# Helper: Create App Icon
+# ============================================
+
+def create_app_icon():
+    """Create the ذ app icon - used for tray and windows"""
+    pm = QPixmap(64, 64)
+    pm.fill(Qt.GlobalColor.transparent)
+    
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+    
+    # خلفية دائرية خضراء إسلامية
+    grad = QRadialGradient(32, 32, 30)
+    grad.setColorAt(0, QColor(0, 180, 100))
+    grad.setColorAt(0.7, QColor(0, 140, 80))
+    grad.setColorAt(1, QColor(0, 100, 60))
+    
+    p.setBrush(QBrush(grad))
+    p.setPen(QPen(QColor(255, 255, 255), 2))
+    p.drawEllipse(2, 2, 60, 60)
+    
+    # حرف "ذ" كبير وواضح
+    p.setPen(QPen(QColor(255, 255, 255)))
+    font = QFont("Arial", 32, QFont.Weight.Bold)
+    p.setFont(font)
+    p.drawText(pm.rect(), Qt.AlignmentFlag.AlignCenter, "ذ")
+    p.end()
+    
+    return QIcon(pm)
 
 
 # ============================================
@@ -689,8 +1106,11 @@ class SettingsWindow(QMainWindow):
     
     def setup_ui(self):
         self.setWindowTitle("ذِكْر - الإعدادات")
-        self.setMinimumSize(700, 550)
+        self.setMinimumSize(700, 840)  # Increased height +20%
         self.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
+        
+        # Set window icon (same as tray icon)
+        self.setWindowIcon(create_app_icon())
         
         central = QWidget()
         self.setCentralWidget(central)
@@ -710,6 +1130,7 @@ class SettingsWindow(QMainWindow):
         # Tabs
         tabs = QTabWidget()
         tabs.setObjectName("tabs")
+        tabs.addTab(self.create_about_tab(), "ℹ️ حول")
         tabs.addTab(self.create_reminder_tab(), "🔔 التذكيرات")
         tabs.addTab(self.create_appearance_tab(), "🎨 المظهر")
         tabs.addTab(self.create_sound_tab(), "🔊 الصوت")
@@ -737,7 +1158,71 @@ class SettingsWindow(QMainWindow):
         main_layout.addWidget(btn_frame)
         
         self.apply_style()
-    
+
+    def create_about_tab(self):
+        w = QWidget()
+        layout = QVBoxLayout(w)
+        layout.setSpacing(20)
+        layout.setContentsMargins(30, 30, 30, 30)
+
+        # App Title
+        title = QLabel("🌙 ذِكْر - Thikr")
+        title.setObjectName("aboutTitle")
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(title)
+
+        # Brief Description
+        desc = QLabel("برنامج للتذكير بذكر الله يعمل في الخلفية")
+        desc.setObjectName("aboutDesc")
+        desc.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(desc)
+
+        layout.addSpacing(20)
+
+        # Info Group
+        info_group = QGroupBox("معلومات هامة")
+        info_layout = QVBoxLayout(info_group)
+        info_layout.setSpacing(12)
+
+        info_items = [
+            "📍 البرنامج يعمل من شريط المهام (بجانب الساعة)",
+            "⚙️ للإعدادات: انقر مرتين على أيقونة ذ",
+            "📿 لعرض ذكر: انقر مرة واحدة على الأيقونة",
+            "⏸️ للإيقاف المؤقت: انقر يمين ← إيقاف مؤقت",
+        ]
+
+        for item in info_items:
+            lbl = QLabel(item)
+            lbl.setWordWrap(True)
+            info_layout.addWidget(lbl)
+
+        layout.addWidget(info_group)
+
+        # Important Notice
+        notice_group = QGroupBox("⚠️ تنبيه مهم")
+        notice_layout = QVBoxLayout(notice_group)
+
+        notice = QLabel(
+            "أغلق هذه النافذة الآن!\n\n"
+            "البرنامج يعمل دائماً في الخلفية.\n"
+            "لا حاجة لإبقاء هذه النافذة مفتوحة."
+        )
+        notice.setObjectName("noticeLabel")
+        notice.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        notice.setWordWrap(True)
+        notice_layout.addWidget(notice)
+
+        layout.addWidget(notice_group)
+
+        layout.addStretch()
+
+        # Version
+        version = QLabel(f"الإصدار {APP_VERSION}")
+        version.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(version)
+
+        return w
+
     def create_reminder_tab(self):
         w = QWidget()
         layout = QVBoxLayout(w)
@@ -769,6 +1254,7 @@ class SettingsWindow(QMainWindow):
         h.addWidget(QLabel("الفترة (دقيقة):"))
         self.interval_spin = QSpinBox()
         self.interval_spin.setRange(1, 1440)
+        self.interval_spin.setFixedWidth(80)
         h.addWidget(self.interval_spin)
         h.addStretch()
         l1.addLayout(h)
@@ -790,10 +1276,12 @@ class SettingsWindow(QMainWindow):
         h2.addWidget(QLabel("من:"))
         self.quiet_start = QTimeEdit()
         self.quiet_start.setDisplayFormat("HH:mm")
+        self.quiet_start.setFixedWidth(80)
         h2.addWidget(self.quiet_start)
         h2.addWidget(QLabel("إلى:"))
         self.quiet_end = QTimeEdit()
         self.quiet_end.setDisplayFormat("HH:mm")
+        self.quiet_end.setFixedWidth(80)
         h2.addWidget(self.quiet_end)
         h2.addStretch()
         l2.addLayout(h2)
@@ -810,6 +1298,7 @@ class SettingsWindow(QMainWindow):
         h3.addWidget(QLabel("كل (يوم):"))
         self.surah_spin = QSpinBox()
         self.surah_spin.setRange(1, 30)
+        self.surah_spin.setFixedWidth(80)
         h3.addWidget(self.surah_spin)
         h3.addStretch()
         l3.addLayout(h3)
@@ -853,6 +1342,7 @@ class SettingsWindow(QMainWindow):
         h2.addWidget(QLabel("حجم الخط:"))
         self.font_spin = QSpinBox()
         self.font_spin.setRange(14, 36)
+        self.font_spin.setFixedWidth(80)
         h2.addWidget(self.font_spin)
         h2.addStretch()
         l2.addLayout(h2)
@@ -861,6 +1351,7 @@ class SettingsWindow(QMainWindow):
         h3.addWidget(QLabel("المدة (ثانية):"))
         self.duration_spin = QSpinBox()
         self.duration_spin.setRange(3, 60)
+        self.duration_spin.setFixedWidth(80)
         h3.addWidget(self.duration_spin)
         h3.addStretch()
         l2.addLayout(h3)
@@ -869,10 +1360,12 @@ class SettingsWindow(QMainWindow):
         h4.addWidget(QLabel("العرض:"))
         self.width_spin = QSpinBox()
         self.width_spin.setRange(300, 800)
+        self.width_spin.setFixedWidth(80)
         h4.addWidget(self.width_spin)
         h4.addWidget(QLabel("الارتفاع:"))
         self.height_spin = QSpinBox()
         self.height_spin.setRange(150, 400)
+        self.height_spin.setFixedWidth(80)
         h4.addWidget(self.height_spin)
         h4.addStretch()
         l2.addLayout(h4)
@@ -919,35 +1412,185 @@ class SettingsWindow(QMainWindow):
         w = QWidget()
         layout = QVBoxLayout(w)
         
-        g = QGroupBox("الأذكار المخصصة")
+        # Get all unique categories from default athkar
+        self.all_categories = list(set(a.get('category', 'مخصص') for a in DEFAULT_ATHKAR))
+        self.all_categories.append('مخصص')
+        self.all_categories = sorted(set(self.all_categories))
+        
+        # Category filter
+        filter_group = QGroupBox("تصفية حسب التصنيف")
+        filter_layout = QHBoxLayout(filter_group)
+        filter_layout.addWidget(QLabel("التصنيف:"))
+        self.category_filter = QComboBox()
+        self.category_filter.addItem("📿 الكل", "all")
+        for cat in self.all_categories:
+            self.category_filter.addItem(cat, cat)
+        self.category_filter.currentIndexChanged.connect(self.filter_athkar_list)
+        filter_layout.addWidget(self.category_filter)
+        filter_layout.addStretch()
+        layout.addWidget(filter_group)
+        
+        # Athkar list
+        g = QGroupBox("الأذكار")
         l = QVBoxLayout(g)
         
         self.athkar_list = QListWidget()
-        self.athkar_list.setMinimumHeight(150)
+        self.athkar_list.setMinimumHeight(200)
+        self.athkar_list.itemClicked.connect(self.on_thikr_selected)
         l.addWidget(self.athkar_list)
         
+        # Buttons
         h1 = QHBoxLayout()
         self.add_btn = QPushButton("➕ إضافة")
         self.add_btn.clicked.connect(self.add_thikr)
+        self.edit_btn = QPushButton("✏️ تعديل")
+        self.edit_btn.clicked.connect(self.edit_thikr)
         self.del_btn = QPushButton("🗑️ حذف")
         self.del_btn.clicked.connect(self.del_thikr)
+        self.clear_btn = QPushButton("🔄 جديد")
+        self.clear_btn.clicked.connect(self.clear_thikr_form)
         h1.addWidget(self.add_btn)
+        h1.addWidget(self.edit_btn)
         h1.addWidget(self.del_btn)
+        h1.addWidget(self.clear_btn)
         h1.addStretch()
         l.addLayout(h1)
         
-        l.addWidget(QLabel("نص الذكر:"))
+        # Input form
+        form_frame = QFrame()
+        form_layout = QVBoxLayout(form_frame)
+        
+        form_layout.addWidget(QLabel("نص الذكر:"))
         self.thikr_input = QLineEdit()
         self.thikr_input.setPlaceholderText("أدخل الذكر...")
-        l.addWidget(self.thikr_input)
+        form_layout.addWidget(self.thikr_input)
         
-        l.addWidget(QLabel("الفضيلة (اختياري):"))
+        form_layout.addWidget(QLabel("الفضيلة (اختياري):"))
         self.virtue_input = QLineEdit()
         self.virtue_input.setPlaceholderText("أدخل الفضيلة...")
-        l.addWidget(self.virtue_input)
+        form_layout.addWidget(self.virtue_input)
+        
+        cat_layout = QHBoxLayout()
+        cat_layout.addWidget(QLabel("التصنيف:"))
+        self.category_input = QComboBox()
+        for cat in self.all_categories:
+            self.category_input.addItem(cat, cat)
+        cat_layout.addWidget(self.category_input)
+        cat_layout.addStretch()
+        form_layout.addLayout(cat_layout)
+        
+        l.addWidget(form_frame)
         
         layout.addWidget(g)
+        
+        # Track editing state
+        self.editing_thikr_id = None
+        self.editing_is_custom = False
+        
         return w
+    
+    def get_all_athkar(self):
+        """Get combined list of default + custom athkar"""
+        deleted_ids = self.settings.get('deleted_default_athkar', [])
+        modified = self.settings.get('modified_athkar', {})
+        
+        all_athkar = []
+        
+        # Add default athkar (with modifications applied)
+        for thikr in DEFAULT_ATHKAR:
+            if thikr['id'] in deleted_ids:
+                continue
+            thikr_copy = thikr.copy()
+            thikr_copy['is_custom'] = False
+            # Apply modifications if any
+            if str(thikr['id']) in modified:
+                thikr_copy.update(modified[str(thikr['id'])])
+            all_athkar.append(thikr_copy)
+        
+        # Add custom athkar
+        custom = self.settings.get('custom_athkar', [])
+        for i, thikr in enumerate(custom):
+            thikr_copy = thikr.copy()
+            thikr_copy['id'] = f'custom_{i}'
+            thikr_copy['is_custom'] = True
+            thikr_copy['category'] = thikr.get('category', 'مخصص')
+            all_athkar.append(thikr_copy)
+        
+        return all_athkar
+    
+    def filter_athkar_list(self):
+        """Filter and display athkar based on selected category"""
+        self.athkar_list.clear()
+        selected_cat = self.category_filter.currentData()
+        
+        for thikr in self.get_all_athkar():
+            if selected_cat != "all" and thikr.get('category', 'مخصص') != selected_cat:
+                continue
+            
+            # Display with icon
+            icon = "⭐" if thikr.get('is_custom') else "📌"
+            cat = thikr.get('category', 'مخصص')
+            display_text = f"{icon} {thikr['text'][:50]}{'...' if len(thikr['text']) > 50 else ''} [{cat}]"
+            
+            item = self.athkar_list.addItem(display_text)
+            # Store thikr data with item
+            self.athkar_list.item(self.athkar_list.count() - 1).setData(Qt.ItemDataRole.UserRole, thikr)
+    
+    def on_thikr_selected(self, item):
+        """Populate form when thikr is selected"""
+        thikr = item.data(Qt.ItemDataRole.UserRole)
+        if thikr:
+            self.thikr_input.setText(thikr.get('text', ''))
+            self.virtue_input.setText(thikr.get('virtue', ''))
+            
+            # Set category
+            cat = thikr.get('category', 'مخصص')
+            idx = self.category_input.findData(cat)
+            if idx >= 0:
+                self.category_input.setCurrentIndex(idx)
+            
+            self.editing_thikr_id = thikr.get('id')
+            self.editing_is_custom = thikr.get('is_custom', False)
+    
+    def clear_thikr_form(self):
+        """Clear the form for new entry"""
+        self.thikr_input.clear()
+        self.virtue_input.clear()
+        self.category_input.setCurrentIndex(0)
+        self.editing_thikr_id = None
+        self.editing_is_custom = False
+        self.athkar_list.clearSelection()
+    
+    def edit_thikr(self):
+        """Save edits to selected thikr"""
+        if self.editing_thikr_id is None:
+            QMessageBox.warning(self, "تنبيه", "الرجاء اختيار ذكر للتعديل")
+            return
+        
+        text = self.thikr_input.text().strip()
+        if not text:
+            QMessageBox.warning(self, "تنبيه", "الرجاء إدخال نص الذكر")
+            return
+        
+        virtue = self.virtue_input.text().strip()
+        category = self.category_input.currentData()
+        
+        if self.editing_is_custom:
+            # Edit custom thikr
+            custom = self.settings.get('custom_athkar', [])
+            idx = int(str(self.editing_thikr_id).replace('custom_', ''))
+            if 0 <= idx < len(custom):
+                custom[idx] = {'text': text, 'virtue': virtue, 'category': category}
+                self.settings.set('custom_athkar', custom)
+        else:
+            # Edit default thikr (store modification)
+            modified = self.settings.get('modified_athkar', {})
+            modified[str(self.editing_thikr_id)] = {'text': text, 'virtue': virtue, 'category': category}
+            self.settings.set('modified_athkar', modified)
+        
+        self.filter_athkar_list()
+        self.clear_thikr_form()
+        QMessageBox.information(self, "تم", "تم تعديل الذكر!")
     
     def create_stats_tab(self):
         w = QWidget()
@@ -975,7 +1618,7 @@ class SettingsWindow(QMainWindow):
     def load_values(self):
         # Reminders
         self.reminder_cb.setChecked(self.settings.get('reminder.enabled', True))
-        self.interval_spin.setValue(self.settings.get('reminder.interval_minutes', 60))
+        self.interval_spin.setValue(self.settings.get('reminder.interval_minutes', 1))
         self.random_cb.setChecked(self.settings.get('reminder.random_order', True))
         self.virtue_cb.setChecked(self.settings.get('reminder.show_virtue', True))
         
@@ -1005,9 +1648,8 @@ class SettingsWindow(QMainWindow):
         self.sound_cb.setChecked(self.settings.get('sound.enabled', True))
         self.volume_slider.setValue(self.settings.get('sound.volume', 30))
         
-        # Custom athkar
-        for a in self.settings.get('custom_athkar', []):
-            self.athkar_list.addItem(a.get('text', ''))
+        # Athkar - populate the enhanced list
+        self.filter_athkar_list()
         
         # Stats
         self.update_stats()
@@ -1048,23 +1690,49 @@ class SettingsWindow(QMainWindow):
         self.close()
     
     def add_thikr(self):
+        """Add new custom thikr"""
         text = self.thikr_input.text().strip()
-        if text:
-            custom = self.settings.get('custom_athkar', [])
-            custom.append({'text': text, 'virtue': self.virtue_input.text().strip(), 'category': 'مخصص'})
-            self.settings.set('custom_athkar', custom)
-            self.athkar_list.addItem(text)
-            self.thikr_input.clear()
-            self.virtue_input.clear()
+        if not text:
+            QMessageBox.warning(self, "تنبيه", "الرجاء إدخال نص الذكر")
+            return
+        
+        virtue = self.virtue_input.text().strip()
+        category = self.category_input.currentData() if hasattr(self, 'category_input') else 'مخصص'
+        
+        custom = self.settings.get('custom_athkar', [])
+        custom.append({'text': text, 'virtue': virtue, 'category': category})
+        self.settings.set('custom_athkar', custom)
+        
+        self.filter_athkar_list()
+        self.clear_thikr_form()
+        QMessageBox.information(self, "تم", "تمت إضافة الذكر!")
     
     def del_thikr(self):
-        row = self.athkar_list.currentRow()
-        if row >= 0:
-            self.athkar_list.takeItem(row)
+        """Delete selected thikr"""
+        if self.editing_thikr_id is None:
+            QMessageBox.warning(self, "تنبيه", "الرجاء اختيار ذكر للحذف")
+            return
+        
+        if QMessageBox.question(self, "تأكيد", "هل تريد حذف هذا الذكر؟") != QMessageBox.StandardButton.Yes:
+            return
+        
+        if self.editing_is_custom:
+            # Delete custom thikr
             custom = self.settings.get('custom_athkar', [])
-            if row < len(custom):
-                custom.pop(row)
+            idx = int(str(self.editing_thikr_id).replace('custom_', ''))
+            if 0 <= idx < len(custom):
+                custom.pop(idx)
                 self.settings.set('custom_athkar', custom)
+        else:
+            # Mark default thikr as deleted
+            deleted = self.settings.get('deleted_default_athkar', [])
+            if self.editing_thikr_id not in deleted:
+                deleted.append(self.editing_thikr_id)
+                self.settings.set('deleted_default_athkar', deleted)
+        
+        self.filter_athkar_list()
+        self.clear_thikr_form()
+        QMessageBox.information(self, "تم", "تم حذف الذكر!")
     
     def reset_stats(self):
         if QMessageBox.question(self, "تأكيد", "إعادة تعيين الإحصائيات؟") == QMessageBox.StandardButton.Yes:
@@ -1230,16 +1898,35 @@ exit
             QLabel {{
                 color: {t['secondary']};
                 font-size: 13px;
+                font-weight: bold;
+                margin-right: 10px;
             }}
             #statLabel {{
                 color: {t['text']};
                 font-size: 16px;
                 font-weight: bold;
             }}
+            #aboutTitle {{
+                color: #ffffff;
+                font-size: 28px;
+                font-weight: bold;
+            }}
+            #aboutDesc {{
+                color: #ffffff;
+                font-size: 16px;
+            }}
+            #noticeLabel {{
+                color: #ffffff;
+                font-size: 15px;
+                font-weight: bold;
+                padding: 15px;
+            }}
             QCheckBox {{
                 color: {t['secondary']};
                 font-size: 13px;
-                spacing: 8px;
+                font-weight: bold;
+                spacing: 12px;
+                margin-right: 10px;
             }}
             QCheckBox::indicator {{
                 width: 18px;
@@ -1259,11 +1946,65 @@ exit
                 border-radius: 4px;
                 padding: 6px;
                 min-width: 80px;
+                margin-left: 8px;
+                font-weight: bold;
             }}
             QComboBox QAbstractItemView {{
                 background: {dropdown_bg};
                 color: {t['text']};
                 selection-background-color: {t['accent']};
+            }}
+            QSpinBox::up-button, QTimeEdit::up-button {{
+                background: {t['accent']};
+                border: none;
+                border-radius: 3px;
+                width: 20px;
+                margin: 2px;
+            }}
+            QSpinBox::down-button, QTimeEdit::down-button {{
+                background: {t['accent']};
+                border: none;
+                border-radius: 3px;
+                width: 20px;
+                margin: 2px;
+            }}
+            QSpinBox::up-button:hover, QTimeEdit::up-button:hover,
+            QSpinBox::down-button:hover, QTimeEdit::down-button:hover {{
+                background: {t['glow']};
+            }}
+            QSpinBox::up-arrow, QTimeEdit::up-arrow {{
+                image: none;
+                border-left: 5px solid transparent;
+                border-right: 5px solid transparent;
+                border-bottom: 6px solid white;
+                width: 0;
+                height: 0;
+            }}
+            QSpinBox::down-arrow, QTimeEdit::down-arrow {{
+                image: none;
+                border-left: 5px solid transparent;
+                border-right: 5px solid transparent;
+                border-top: 6px solid white;
+                width: 0;
+                height: 0;
+            }}
+            QComboBox::drop-down {{
+                background: {t['accent']};
+                border: none;
+                border-radius: 3px;
+                width: 25px;
+                margin: 2px;
+            }}
+            QComboBox::drop-down:hover {{
+                background: {t['glow']};
+            }}
+            QComboBox::down-arrow {{
+                image: none;
+                border-left: 5px solid transparent;
+                border-right: 5px solid transparent;
+                border-top: 6px solid white;
+                width: 0;
+                height: 0;
             }}
             QSlider::groove:horizontal {{
                 height: 6px;
@@ -1331,13 +2072,18 @@ exit
 # ============================================
 
 class ThikrApp(QObject):
-    def __init__(self):
+    def __init__(self, existing_app=None, existing_settings=None):
         super().__init__()
-        self.app = QApplication(sys.argv)
-        self.app.setQuitOnLastWindowClosed(False)
+        # استخدام تطبيق موجود أو إنشاء جديد
+        if existing_app:
+            self.app = existing_app
+        else:
+            self.app = QApplication(sys.argv)
+            self.app.setQuitOnLastWindowClosed(False)
         self.app.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
         
-        self.settings = SettingsManager()
+        # استخدام إعدادات موجودة أو إنشاء جديدة
+        self.settings = existing_settings if existing_settings else SettingsManager()
         self.popup = None
         self.settings_window = None
         self.reminder_thread = None
@@ -1348,32 +2094,8 @@ class ThikrApp(QObject):
     def setup_tray(self):
         self.tray = QSystemTrayIcon(self.app)
         
-        # Create icon - أيقونة واضحة ومميزة
-        pm = QPixmap(64, 64)
-        pm.fill(Qt.GlobalColor.transparent)
-        
-        p = QPainter(pm)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
-        
-        # خلفية دائرية خضراء إسلامية
-        grad = QRadialGradient(32, 32, 30)
-        grad.setColorAt(0, QColor(0, 180, 100))      # أخضر فاتح في المنتصف
-        grad.setColorAt(0.7, QColor(0, 140, 80))     # أخضر متوسط
-        grad.setColorAt(1, QColor(0, 100, 60))       # أخضر داكن في الأطراف
-        
-        p.setBrush(QBrush(grad))
-        p.setPen(QPen(QColor(255, 255, 255), 2))     # حدود بيضاء
-        p.drawEllipse(2, 2, 60, 60)
-        
-        # حرف "ذ" كبير وواضح
-        p.setPen(QPen(QColor(255, 255, 255)))
-        font = QFont("Arial", 32, QFont.Weight.Bold)
-        p.setFont(font)
-        p.drawText(pm.rect(), Qt.AlignmentFlag.AlignCenter, "ذ")
-        p.end()
-        
-        self.tray.setIcon(QIcon(pm))
+        # Use the shared app icon
+        self.tray.setIcon(create_app_icon())
         self.tray.setToolTip("ذِكْر - تذكير بذكر الله")
         
         # Menu
@@ -1547,14 +2269,72 @@ class ThikrApp(QObject):
         self.app.quit()
     
     def run(self):
-        self.tray.showMessage("ذِكْر", "البرنامج يعمل الآن\nانقر مرتين للإعدادات", 
-                             QSystemTrayIcon.MessageIcon.Information, 3000)
+        # Open settings window on launch (About tab is first)
+        self.show_settings()
         return self.app.exec()
 
 
 def main():
-    app = ThikrApp()
-    sys.exit(app.run())
+    """نقطة الدخول الرئيسية مع دعم الإعداد الأول"""
+    try:
+        # دعم التجميد للتطبيقات المجمعة (PyInstaller)
+        import multiprocessing
+        multiprocessing.freeze_support()
+        
+        # Check single instance FIRST
+        if not acquire_single_instance_lock():
+            import ctypes
+            ctypes.windll.user32.MessageBoxW(0, "البرنامج يعمل بالفعل!\n\nThe application is already running!", "ذِكْر", 0x40)
+            sys.exit(0)
+        
+        # إنشاء تطبيق Qt أولاً
+        qt_app = QApplication(sys.argv)
+        qt_app.setQuitOnLastWindowClosed(False)
+        
+        # تحميل الإعدادات للتحقق من first_run
+        settings = SettingsManager()
+        
+        # التحقق إذا كان التشغيل الأول
+        if not settings.get('first_run_complete', False):
+            # إظهار نافذة الإعداد الأول
+            first_run_dialog = FirstRunDialog()
+            
+            def on_setup_complete(enable_autostart):
+                # حفظ إعداد التشغيل التلقائي
+                if enable_autostart:
+                    set_autostart_enabled(True)
+                
+                # حفظ أن الإعداد الأول اكتمل
+                settings.set('first_run_complete', True)
+                
+                # بدء التطبيق الرئيسي
+                start_main_app(qt_app, settings)
+            
+            first_run_dialog.setup_complete.connect(on_setup_complete)
+            first_run_dialog.start_setup()
+            sys.exit(qt_app.exec())
+        else:
+            # التشغيل العادي
+            start_main_app(qt_app, settings)
+            sys.exit(qt_app.exec())
+    
+    except Exception as e:
+        # Global exception handler - show error dialog
+        import ctypes
+        import traceback
+        error_msg = f"خطأ غير متوقع:\n{str(e)}\n\nUnexpected error:\n{traceback.format_exc()[:500]}"
+        ctypes.windll.user32.MessageBoxW(0, error_msg, "ذِكْر - خطأ", 0x10)
+        sys.exit(1)
+
+# Global reference to prevent garbage collection
+_app_instance = None
+
+def start_main_app(qt_app, settings):
+    """بدء التطبيق الرئيسي بعد الإعداد الأول"""
+    global _app_instance
+    _app_instance = ThikrApp(existing_app=qt_app, existing_settings=settings)
+    # Open settings window on launch (About tab is first)
+    _app_instance.show_settings()
 
 
 if __name__ == "__main__":
