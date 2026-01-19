@@ -662,7 +662,8 @@ class SettingsManager:
                 "last_reset": None
             },
             "timezone": "UTC+3",  # Default timezone
-            "custom_athkar": []
+            "custom_athkar": [],
+            "first_run_complete": False  # Track if first run setup is done
         }
         
         if self.settings_file.exists():
@@ -2716,6 +2717,11 @@ def main():
         # تحميل الإعدادات للتحقق من first_run
         settings = SettingsManager()
 
+        # Debug: Log settings file location and first_run status
+        log_debug(f"Settings file: {settings.settings_file}")
+        log_debug(f"Settings file exists: {settings.settings_file.exists()}")
+        log_debug(f"first_run_complete value: {settings.get('first_run_complete', False)}")
+
         # التحقق إذا كان التشغيل الأول
         if not settings.get('first_run_complete', False):
             # إظهار نافذة الإعداد الأول
@@ -2728,6 +2734,8 @@ def main():
 
                 # حفظ أن الإعداد الأول اكتمل
                 settings.set('first_run_complete', True)
+                settings.save()  # Ensure it's saved to disk
+                log_debug(f"First run complete saved. File: {settings.settings_file}")
 
                 # بدء التطبيق الرئيسي (not silent on first run)
                 start_main_app(qt_app, settings, silent=False)
