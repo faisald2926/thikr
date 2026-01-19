@@ -15,6 +15,9 @@ import os
 import json
 import random
 import time
+import subprocess
+import winsound
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import winreg
@@ -47,30 +50,90 @@ except ImportError:
                 return timedelta(0)
 
 # ============================================
-# Single Instance Lock
+# Single Instance Lock (Robust - handles stale locks)
 # ============================================
 
 _lock_file = None
+_lock_path = None
+
+def is_process_running(pid):
+    """Check if a process with given PID is still running"""
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        SYNCHRONIZE = 0x00100000
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        handle = kernel32.OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if handle:
+            kernel32.CloseHandle(handle)
+            return True
+        return False
+    except:
+        return False
 
 def acquire_single_instance_lock():
-    """Prevent multiple instances from running"""
-    global _lock_file
-    lock_path = Path(tempfile.gettempdir()) / "thikr_instance.lock"
+    """Prevent multiple instances from running - handles stale locks from crashes/reboots"""
+    global _lock_file, _lock_path
+    _lock_path = Path(tempfile.gettempdir()) / "thikr_instance.lock"
+
+    # First attempt
     try:
-        _lock_file = open(lock_path, 'w')
+        _lock_file = open(_lock_path, 'w+')
         msvcrt.locking(_lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+        # Write our PID so we can be identified
+        _lock_file.seek(0)
+        _lock_file.write(str(os.getpid()))
+        _lock_file.flush()
         atexit.register(release_lock)
         return True
     except (OSError, IOError):
-        return False
+        # Lock failed - check if the other process is still alive
+        if _lock_file:
+            _lock_file.close()
+            _lock_file = None
+
+        try:
+            # Read the PID from lock file
+            with open(_lock_path, 'r') as f:
+                content = f.read().strip()
+                if content:
+                    old_pid = int(content)
+                    if is_process_running(old_pid):
+                        # Another instance is truly running
+                        return False
+
+            # Stale lock - remove it and try again
+            try:
+                os.remove(_lock_path)
+            except:
+                pass
+
+            # Second attempt after removing stale lock
+            _lock_file = open(_lock_path, 'w+')
+            msvcrt.locking(_lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+            _lock_file.seek(0)
+            _lock_file.write(str(os.getpid()))
+            _lock_file.flush()
+            atexit.register(release_lock)
+            return True
+        except:
+            return False
 
 def release_lock():
-    """Release the single instance lock"""
-    global _lock_file
+    """Release the single instance lock and clean up"""
+    global _lock_file, _lock_path
     if _lock_file:
         try:
             msvcrt.locking(_lock_file.fileno(), msvcrt.LK_UNLCK, 1)
             _lock_file.close()
+        except:
+            pass
+        _lock_file = None
+
+    # Clean up lock file
+    if _lock_path and _lock_path.exists():
+        try:
+            os.remove(_lock_path)
         except:
             pass
 
@@ -159,6 +222,38 @@ ensure_data_directory()
 
 
 # ============================================
+# Simple Debug Logging (for troubleshooting)
+# ============================================
+
+LOG_FILE = DATA_DIR / "thikr_debug.log"
+DEBUG_ENABLED = True  # Set to False to disable logging
+
+def log_debug(message):
+    """Write debug message to log file"""
+    if not DEBUG_ENABLED:
+        return
+    try:
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open(LOG_FILE, 'a', encoding='utf-8') as f:
+            f.write(f"[{timestamp}] {message}\n")
+    except:
+        pass
+
+def clear_old_logs():
+    """Clear log file if it gets too large (>1MB)"""
+    try:
+        if LOG_FILE.exists() and LOG_FILE.stat().st_size > 1024 * 1024:
+            LOG_FILE.unlink()
+    except:
+        pass
+
+# Clear old logs on startup
+clear_old_logs()
+log_debug("=" * 50)
+log_debug("App starting...")
+
+
+# ============================================
 # Timezone Helper Functions
 # ============================================
 
@@ -217,21 +312,91 @@ def set_autostart_enabled(enable: bool):
             0, winreg.KEY_SET_VALUE
         )
         if enable:
-            # استخدام المسار الكامل للتطبيق
+            # استخدام المسار الكامل للتطبيق مع --silent للتشغيل الصامت
             if getattr(sys, 'frozen', False):
-                exe_path = sys.executable
+                # Running as compiled .exe
+                exe_path = f'"{sys.executable}" --silent'
             else:
-                exe_path = f'"{sys.executable}" "{Path(__file__).resolve()}"'
+                # Running from Python - use pythonw.exe for headless execution
+                python_path = sys.executable
+                # Convert python.exe to pythonw.exe for no console window
+                if python_path.lower().endswith('python.exe'):
+                    pythonw_path = python_path[:-10] + 'pythonw.exe'
+                    if Path(pythonw_path).exists():
+                        python_path = pythonw_path
+                script_path = Path(__file__).resolve()
+                exe_path = f'"{python_path}" "{script_path}" --silent'
             winreg.SetValueEx(key, "Thikr", 0, winreg.REG_SZ, exe_path)
+
+            # Also setup Task Scheduler as backup (more reliable)
+            setup_task_scheduler_autostart(enable=True)
         else:
             try:
                 winreg.DeleteValue(key, "Thikr")
             except FileNotFoundError:
                 pass
+            # Also remove Task Scheduler task
+            setup_task_scheduler_autostart(enable=False)
         winreg.CloseKey(key)
         return True
     except Exception as e:
         print(f"Autostart error: {e}")
+        return False
+
+
+def setup_task_scheduler_autostart(enable: bool):
+    """Setup Windows Task Scheduler as backup autostart method (more reliable)"""
+    task_name = "ThikrReminder"
+
+    try:
+        if enable:
+            # Build the command to run with --silent flag
+            if getattr(sys, 'frozen', False):
+                exe_path = sys.executable
+                command = f'"{exe_path}" --silent'
+            else:
+                python_path = sys.executable
+                if python_path.lower().endswith('python.exe'):
+                    pythonw_path = python_path[:-10] + 'pythonw.exe'
+                    if Path(pythonw_path).exists():
+                        python_path = pythonw_path
+                script_path = Path(__file__).resolve()
+                command = f'"{python_path}" "{script_path}" --silent'
+
+            # Delete existing task first (ignore errors)
+            subprocess.run(
+                ['schtasks', '/Delete', '/TN', task_name, '/F'],
+                capture_output=True,
+                creationflags=subprocess.CREATE_NO_WINDOW
+            )
+
+            # Create new scheduled task to run at logon with 30 second delay
+            # This runs in user context, no admin required
+            result = subprocess.run(
+                [
+                    'schtasks', '/Create',
+                    '/TN', task_name,
+                    '/TR', command,
+                    '/SC', 'ONLOGON',  # Run at user logon
+                    '/DELAY', '0000:30',  # 30 second delay after logon
+                    '/RL', 'LIMITED',  # Run with limited privileges (user level)
+                    '/F'  # Force overwrite if exists
+                ],
+                capture_output=True,
+                text=True,
+                creationflags=subprocess.CREATE_NO_WINDOW
+            )
+            return result.returncode == 0
+        else:
+            # Delete the scheduled task
+            result = subprocess.run(
+                ['schtasks', '/Delete', '/TN', task_name, '/F'],
+                capture_output=True,
+                creationflags=subprocess.CREATE_NO_WINDOW
+            )
+            return True
+    except Exception as e:
+        print(f"Task Scheduler error: {e}")
         return False
 
 
@@ -925,33 +1090,71 @@ class ReminderPopup(QWidget):
             self.virtue_label.setVisible(bool(virtue) and self.settings.get('reminder.show_virtue', True))
         
         self.position_popup()
-        self.setWindowOpacity(0)
-        self.show()
-        self.show_anim.start()
-        
+
+        # Show with animation, but ensure visibility even if animation fails
+        try:
+            self.setWindowOpacity(0)
+            self.show()
+            self.raise_()  # Bring to front
+            self.activateWindow()  # Activate window
+            self.show_anim.start()
+
+            # Fallback: Force visibility after 500ms if animation didn't work
+            QTimer.singleShot(500, self.ensure_visible)
+        except Exception as e:
+            log_debug(f"Animation error, forcing visibility: {e}")
+            self.setWindowOpacity(self.settings.get('popup.opacity', 0.95))
+            self.show()
+            self.raise_()
+
         duration = self.settings.get('popup.duration_seconds', 8) * 1000
         self.close_timer.start(duration)
         self.progress_value = 100
         self.progress.setValue(100)
         self.progress_timer.start(duration // 100)
-    
+
+    def ensure_visible(self):
+        """Fallback to ensure popup is visible if animation failed"""
+        if self.isVisible() and self.windowOpacity() < 0.1:
+            log_debug("Forcing popup visibility (animation may have failed)")
+            self.setWindowOpacity(self.settings.get('popup.opacity', 0.95))
+
     def position_popup(self):
-        screen = QGuiApplication.primaryScreen().availableGeometry()
-        pos = self.settings.get('popup.position', 'bottom_right')
-        margin = 20
-        
-        positions = {
-            'top_left': (margin, margin),
-            'top_right': (screen.width() - self.width() - margin, margin),
-            'top_center': ((screen.width() - self.width()) // 2, margin),
-            'bottom_left': (margin, screen.height() - self.height() - margin),
-            'bottom_right': (screen.width() - self.width() - margin, screen.height() - self.height() - margin),
-            'bottom_center': ((screen.width() - self.width()) // 2, screen.height() - self.height() - margin),
-            'center': ((screen.width() - self.width()) // 2, (screen.height() - self.height()) // 2)
-        }
-        
-        x, y = positions.get(pos, positions['bottom_right'])
-        self.move(int(x), int(y))
+        try:
+            screen = QGuiApplication.primaryScreen()
+            if screen is None:
+                log_debug("No primary screen found, using fallback position")
+                self.move(100, 100)
+                return
+
+            geom = screen.availableGeometry()
+            if geom.width() <= 0 or geom.height() <= 0:
+                log_debug(f"Invalid screen geometry: {geom}, using fallback")
+                self.move(100, 100)
+                return
+
+            pos = self.settings.get('popup.position', 'bottom_right')
+            margin = 20
+
+            positions = {
+                'top_left': (margin, margin),
+                'top_right': (geom.width() - self.width() - margin, margin),
+                'top_center': ((geom.width() - self.width()) // 2, margin),
+                'bottom_left': (margin, geom.height() - self.height() - margin),
+                'bottom_right': (geom.width() - self.width() - margin, geom.height() - self.height() - margin),
+                'bottom_center': ((geom.width() - self.width()) // 2, geom.height() - self.height() - margin),
+                'center': ((geom.width() - self.width()) // 2, (geom.height() - self.height()) // 2)
+            }
+
+            x, y = positions.get(pos, positions['bottom_right'])
+            # Ensure coordinates are valid (on screen)
+            x = max(0, min(int(x), geom.width() - self.width()))
+            y = max(0, min(int(y), geom.height() - self.height()))
+            self.move(x, y)
+            log_debug(f"Popup positioned at ({x}, {y})")
+        except Exception as e:
+            log_debug(f"Error positioning popup: {e}, using fallback")
+            self.move(100, 100)
     
     def update_progress(self):
         self.progress_value -= 1
@@ -979,61 +1182,123 @@ class ReminderPopup(QWidget):
 
 
 # ============================================
-# خيط التذكير
+# خيط التذكير (Robust - with exception handling and auto-recovery)
 # ============================================
 
 class ReminderThread(QThread):
     show_reminder = pyqtSignal(dict, bool)
-    
+    thread_error = pyqtSignal(str)  # Signal for error reporting
+    thread_started = pyqtSignal()   # Signal when thread starts successfully
+
     def __init__(self, settings):
         super().__init__()
         self.settings = settings
         self.running = True
         self.paused = False
-    
+        self.error_count = 0
+        self.max_errors = 5  # Max consecutive errors before giving up
+        self.first_run = True  # Flag for showing reminder sooner on first run
+
     def run(self):
+        log_debug("ReminderThread started")
+        self.thread_started.emit()
+
         while self.running:
-            if not self.paused and self.settings.get('reminder.enabled', True):
-                if not self.is_quiet_time():
-                    if self.should_show_surah():
-                        surah = self.settings.get_random_surah()
-                        if surah:
-                            self.show_reminder.emit(surah, True)
-                            tz = self.settings.get('timezone', 'UTC+3')
-                            self.settings.set('surah_reminder.last_shown', get_now(tz).isoformat())
+            try:
+                enabled = self.settings.get('reminder.enabled', True)
+                paused = self.paused
+                quiet = self.is_quiet_time()
+
+                log_debug(f"ReminderThread loop: enabled={enabled}, paused={paused}, quiet={quiet}, first_run={self.first_run}")
+
+                # On first run, show reminder after a short delay (10 seconds)
+                if self.first_run:
+                    self.first_run = False
+                    log_debug("First run - waiting 10 seconds...")
+                    # Wait 10 seconds before first reminder (instead of full interval)
+                    for _ in range(10):
+                        if not self.running:
+                            break
+                        time.sleep(1)
+
+                    if self.running and not paused and enabled:
+                        if not quiet:
+                            thikr = self.settings.get_random_thikr()
+                            log_debug(f"Emitting first reminder: {thikr.get('text', '')[:30]}...")
+                            self.show_reminder.emit(thikr, False)
+                            self.error_count = 0
+                        else:
+                            log_debug("Skipped first reminder - quiet time")
                     else:
-                        thikr = self.settings.get_random_thikr()
-                        self.show_reminder.emit(thikr, False)
+                        log_debug(f"Skipped first reminder - running={self.running}, paused={paused}, enabled={enabled}")
+                else:
+                    # Normal reminder cycle (not first run)
+                    if not paused and enabled:
+                        if not quiet:
+                            if self.should_show_surah():
+                                surah = self.settings.get_random_surah()
+                                if surah:
+                                    log_debug(f"Emitting surah reminder: {surah.get('name', '')}")
+                                    self.show_reminder.emit(surah, True)
+                                    tz = self.settings.get('timezone', 'UTC+3')
+                                    self.settings.set('surah_reminder.last_shown', get_now(tz).isoformat())
+                            else:
+                                thikr = self.settings.get_random_thikr()
+                                log_debug(f"Emitting thikr reminder: {thikr.get('text', '')[:30]}...")
+                                self.show_reminder.emit(thikr, False)
+                            self.error_count = 0
+                        else:
+                            log_debug("Skipped reminder - quiet time")
+                    else:
+                        log_debug(f"Skipped reminder - paused={paused}, enabled={enabled}")
 
-            interval = self.settings.get('reminder.interval_minutes', 1) * 60
-            for _ in range(interval):
-                if not self.running:
+                # Wait for interval before next reminder
+                interval = self.settings.get('reminder.interval_minutes', 1) * 60
+                log_debug(f"Waiting {interval} seconds until next reminder...")
+                for _ in range(interval):
+                    if not self.running:
+                        break
+                    time.sleep(1)
+
+            except Exception as e:
+                self.error_count += 1
+                error_msg = f"ReminderThread error ({self.error_count}/{self.max_errors}): {str(e)}"
+                self.thread_error.emit(error_msg)
+
+                if self.error_count >= self.max_errors:
+                    # Too many errors - signal for restart
+                    self.thread_error.emit("CRITICAL: Max errors reached, thread needs restart")
                     break
-                time.sleep(1)
-    
+
+                # Wait before retrying to avoid rapid error loops
+                time.sleep(5)
+
     def is_quiet_time(self):
-        q = self.settings.get('reminder.quiet_hours', {})
-        if not q.get('enabled'):
-            return False
-
-        tz = self.settings.get('timezone', 'UTC+3')
-        now = get_now(tz).time()
-        start = datetime.strptime(q.get('start', '23:00'), '%H:%M').time()
-        end = datetime.strptime(q.get('end', '06:00'), '%H:%M').time()
-
-        if start <= end:
-            return start <= now <= end
-        return now >= start or now <= end
-    
-    def should_show_surah(self):
-        if not self.settings.get('surah_reminder.enabled', True):
-            return False
-
-        last = self.settings.get('surah_reminder.last_shown')
-        if not last:
-            return True
-
         try:
+            q = self.settings.get('reminder.quiet_hours', {})
+            if not q.get('enabled'):
+                return False
+
+            tz = self.settings.get('timezone', 'UTC+3')
+            now = get_now(tz).time()
+            start = datetime.strptime(q.get('start', '23:00'), '%H:%M').time()
+            end = datetime.strptime(q.get('end', '06:00'), '%H:%M').time()
+
+            if start <= end:
+                return start <= now <= end
+            return now >= start or now <= end
+        except:
+            return False  # Default to not quiet time if there's an error
+
+    def should_show_surah(self):
+        try:
+            if not self.settings.get('surah_reminder.enabled', True):
+                return False
+
+            last = self.settings.get('surah_reminder.last_shown')
+            if not last:
+                return True
+
             last_date = datetime.fromisoformat(last)
             tz = self.settings.get('timezone', 'UTC+3')
             now = get_now(tz)
@@ -1046,16 +1311,23 @@ class ReminderThread(QThread):
             days = self.settings.get('surah_reminder.interval_days', 3)
             return now - last_date >= timedelta(days=days)
         except:
-            return True
-    
+            return False  # Default to regular thikr if there's an error
+
     def stop(self):
         self.running = False
-    
+
     def pause(self):
         self.paused = True
-    
+
     def resume(self):
         self.paused = False
+
+    def reset_for_restart(self):
+        """Reset state for thread restart"""
+        self.running = True
+        self.paused = False
+        self.error_count = 0
+        self.first_run = False  # Don't show immediate reminder on restart
 
 
 # ============================================
@@ -2081,15 +2353,42 @@ class ThikrApp(QObject):
             self.app = QApplication(sys.argv)
             self.app.setQuitOnLastWindowClosed(False)
         self.app.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
-        
+
         # استخدام إعدادات موجودة أو إنشاء جديدة
         self.settings = existing_settings if existing_settings else SettingsManager()
         self.popup = None
         self.settings_window = None
         self.reminder_thread = None
-        
+        self.thread_restart_count = 0
+        self.max_thread_restarts = 10  # Max restarts before giving up
+
+        # Watchdog timer to ensure reminder thread stays alive
+        self.watchdog_timer = QTimer(self)
+        self.watchdog_timer.timeout.connect(self.check_reminder_thread)
+        self.watchdog_timer.start(30000)  # Check every 30 seconds
+
+        # Backup reminder timer (main thread) - fires if thread signals fail
+        self.last_reminder_time = None
+        self.backup_timer = QTimer(self)
+        self.backup_timer.timeout.connect(self.backup_reminder_check)
+        self.backup_timer.start(60000)  # Check every 60 seconds
+
         self.setup_tray()
-        self.start_reminder()
+
+        # Delay thread start slightly to ensure Qt event loop is ready
+        QTimer.singleShot(2000, self.start_reminder)
+
+        # Show a startup reminder after 15 seconds to confirm app is working
+        QTimer.singleShot(15000, self.show_startup_reminder)
+
+    def show_startup_reminder(self):
+        """Show a reminder shortly after startup to confirm app is working"""
+        if self.settings.get('reminder.enabled', True):
+            # Only show if no reminder has been shown yet
+            if self.last_reminder_time is None:
+                log_debug("Showing startup reminder to confirm app is working")
+                thikr = self.settings.get_random_thikr()
+                self.show_popup(thikr, False)
     
     def setup_tray(self):
         self.tray = QSystemTrayIcon(self.app)
@@ -2141,19 +2440,127 @@ class ThikrApp(QObject):
         self.tray.show()
     
     def start_reminder(self):
+        """Start the reminder thread with error handling"""
+        log_debug("start_reminder called")
+        if self.reminder_thread and self.reminder_thread.isRunning():
+            log_debug("Thread already running, skipping start")
+            return  # Already running
+
+        log_debug("Creating new ReminderThread...")
         self.reminder_thread = ReminderThread(self.settings)
-        self.reminder_thread.show_reminder.connect(self.show_popup)
+
+        # Use QueuedConnection to ensure signals from thread are properly
+        # delivered to main thread's event loop (critical for post-restart reliability)
+        self.reminder_thread.show_reminder.connect(
+            self.show_popup,
+            Qt.ConnectionType.QueuedConnection
+        )
+        self.reminder_thread.thread_error.connect(
+            self.on_thread_error,
+            Qt.ConnectionType.QueuedConnection
+        )
+        self.reminder_thread.finished.connect(self.on_thread_finished)
         self.reminder_thread.start()
-    
+        log_debug("ReminderThread started successfully")
+
+    def on_thread_error(self, error_msg):
+        """Handle errors from reminder thread"""
+        log_debug(f"Thread error: {error_msg}")
+
+    def on_thread_finished(self):
+        """Handle when reminder thread finishes (possibly due to error)"""
+        log_debug(f"ReminderThread finished! restart_count={self.thread_restart_count}")
+        if self.thread_restart_count < self.max_thread_restarts:
+            # Auto-restart the thread after a short delay
+            QTimer.singleShot(2000, self.restart_reminder_thread)
+
+    def restart_reminder_thread(self):
+        """Restart the reminder thread after it dies"""
+        log_debug("Attempting to restart reminder thread...")
+        if self.reminder_thread:
+            if self.reminder_thread.isRunning():
+                log_debug("Thread still running, no restart needed")
+                return  # Still running, no need to restart
+
+            self.thread_restart_count += 1
+            log_debug(f"Restarting thread (attempt {self.thread_restart_count})")
+
+            # Create new thread
+            self.reminder_thread = ReminderThread(self.settings)
+            self.reminder_thread.show_reminder.connect(self.show_popup)
+            self.reminder_thread.thread_error.connect(self.on_thread_error)
+            self.reminder_thread.finished.connect(self.on_thread_finished)
+            self.reminder_thread.first_run = False  # Don't show immediate reminder on restart
+            self.reminder_thread.start()
+
+    def check_reminder_thread(self):
+        """Watchdog: Check if reminder thread is still alive and restart if needed"""
+        is_running = self.reminder_thread is not None and self.reminder_thread.isRunning()
+        if not is_running:
+            log_debug(f"Watchdog: Thread not running! restart_count={self.thread_restart_count}")
+            if self.thread_restart_count < self.max_thread_restarts:
+                self.restart_reminder_thread()
+
+    def backup_reminder_check(self):
+        """Backup mechanism: Show reminder from main thread if thread signals failed"""
+        if not self.settings.get('reminder.enabled', True):
+            return
+
+        if self.reminder_thread and self.reminder_thread.paused:
+            return
+
+        interval_minutes = self.settings.get('reminder.interval_minutes', 1)
+        now = datetime.now()
+
+        # If no reminder has been shown for twice the interval, force one
+        if self.last_reminder_time is None:
+            # First check - just set the time
+            self.last_reminder_time = now
+            return
+
+        elapsed_minutes = (now - self.last_reminder_time).total_seconds() / 60
+
+        # If more than 2x interval has passed without a reminder, force one
+        if elapsed_minutes > (interval_minutes * 2):
+            log_debug(f"Backup timer: No reminder for {elapsed_minutes:.1f} min, forcing one")
+            thikr = self.settings.get_random_thikr()
+            self.show_popup(thikr, False)
+
     def show_popup(self, data, is_surah=False):
-        if self.popup:
-            self.popup.close()
-            self.popup.deleteLater()
-        
-        self.popup = ReminderPopup(self.settings)
-        self.popup.closed.connect(self.on_popup_closed)
-        self.popup.show_thikr(data, is_surah)
-        self.settings.increment_counter()
+        log_debug(f"show_popup called! is_surah={is_surah}")
+        try:
+            if self.popup:
+                self.popup.close()
+                self.popup.deleteLater()
+
+            self.popup = ReminderPopup(self.settings)
+            self.popup.closed.connect(self.on_popup_closed)
+            self.popup.show_thikr(data, is_surah)
+            self.settings.increment_counter()
+
+            # Track last reminder time for backup mechanism
+            self.last_reminder_time = datetime.now()
+
+            # Play notification sound if enabled
+            self.play_notification_sound()
+            log_debug("Popup shown successfully")
+        except Exception as e:
+            log_debug(f"Error showing popup: {e}")
+
+    def play_notification_sound(self):
+        """Play a notification sound when reminder shows"""
+        if self.settings.get('sound.enabled', True):
+            try:
+                # Play Windows default notification sound in background thread
+                def play_sound():
+                    try:
+                        # Use Windows system sound (asterisk/notification)
+                        winsound.PlaySound("SystemAsterisk", winsound.SND_ALIAS | winsound.SND_ASYNC)
+                    except:
+                        pass
+                threading.Thread(target=play_sound, daemon=True).start()
+            except:
+                pass
     
     def on_popup_closed(self):
         if self.popup:
@@ -2256,15 +2663,25 @@ class ThikrApp(QObject):
             self.show_now()
     
     def quit(self):
+        log_debug("App quitting...")
+        # Stop all timers first
+        if self.watchdog_timer:
+            self.watchdog_timer.stop()
+        if self.backup_timer:
+            self.backup_timer.stop()
+
+        # Prevent auto-restart during shutdown
+        self.max_thread_restarts = 0
+
         if self.reminder_thread:
             self.reminder_thread.stop()
             self.reminder_thread.wait(2000)
-        
+
         if self.popup:
             self.popup.close()
         if self.settings_window:
             self.settings_window.close()
-        
+
         self.tray.hide()
         self.app.quit()
     
@@ -2280,42 +2697,47 @@ def main():
         # دعم التجميد للتطبيقات المجمعة (PyInstaller)
         import multiprocessing
         multiprocessing.freeze_support()
-        
+
+        # Check for --silent flag (used by autostart)
+        silent_mode = '--silent' in sys.argv or '-s' in sys.argv
+
         # Check single instance FIRST
         if not acquire_single_instance_lock():
-            import ctypes
-            ctypes.windll.user32.MessageBoxW(0, "البرنامج يعمل بالفعل!\n\nThe application is already running!", "ذِكْر", 0x40)
+            # If in silent mode, just exit quietly
+            if not silent_mode:
+                import ctypes
+                ctypes.windll.user32.MessageBoxW(0, "البرنامج يعمل بالفعل!\n\nThe application is already running!", "ذِكْر", 0x40)
             sys.exit(0)
-        
+
         # إنشاء تطبيق Qt أولاً
         qt_app = QApplication(sys.argv)
         qt_app.setQuitOnLastWindowClosed(False)
-        
+
         # تحميل الإعدادات للتحقق من first_run
         settings = SettingsManager()
-        
+
         # التحقق إذا كان التشغيل الأول
         if not settings.get('first_run_complete', False):
             # إظهار نافذة الإعداد الأول
             first_run_dialog = FirstRunDialog()
-            
+
             def on_setup_complete(enable_autostart):
                 # حفظ إعداد التشغيل التلقائي
                 if enable_autostart:
                     set_autostart_enabled(True)
-                
+
                 # حفظ أن الإعداد الأول اكتمل
                 settings.set('first_run_complete', True)
-                
-                # بدء التطبيق الرئيسي
-                start_main_app(qt_app, settings)
-            
+
+                # بدء التطبيق الرئيسي (not silent on first run)
+                start_main_app(qt_app, settings, silent=False)
+
             first_run_dialog.setup_complete.connect(on_setup_complete)
             first_run_dialog.start_setup()
             sys.exit(qt_app.exec())
         else:
-            # التشغيل العادي
-            start_main_app(qt_app, settings)
+            # التشغيل العادي - use silent mode if specified
+            start_main_app(qt_app, settings, silent=silent_mode)
             sys.exit(qt_app.exec())
     
     except Exception as e:
@@ -2329,12 +2751,26 @@ def main():
 # Global reference to prevent garbage collection
 _app_instance = None
 
-def start_main_app(qt_app, settings):
+def start_main_app(qt_app, settings, silent=False):
     """بدء التطبيق الرئيسي بعد الإعداد الأول"""
     global _app_instance
+    log_debug(f"start_main_app called, silent={silent}")
     _app_instance = ThikrApp(existing_app=qt_app, existing_settings=settings)
-    # Open settings window on launch (About tab is first)
-    _app_instance.show_settings()
+    log_debug("ThikrApp instance created")
+
+    # Only show settings window if not starting silently
+    # For autostart, we want to run silently in background
+    if not silent:
+        _app_instance.show_settings()
+        log_debug("Settings window shown")
+    else:
+        # Show tray notification that app is running
+        _app_instance.tray.showMessage(
+            "ذِكْر",
+            "يعمل في الخلفية - اضغط على الأيقونة للإعدادات",
+            QSystemTrayIcon.MessageIcon.Information,
+            3000
+        )
 
 
 if __name__ == "__main__":
