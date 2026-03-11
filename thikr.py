@@ -285,8 +285,25 @@ def get_now(tz_string="UTC+3"):
 # وظائف التشغيل التلقائي (Windows Registry)
 # ============================================
 
+def get_app_launch_command():
+    """Get the command to launch this app at startup, works for both .exe and source."""
+    if getattr(sys, 'frozen', False):
+        # Running as compiled .exe - always reliable
+        return f'"{sys.executable}" --silent'
+    else:
+        # Running from Python source
+        python_path = sys.executable
+        # Convert python.exe to pythonw.exe for no console window
+        if python_path.lower().endswith('python.exe'):
+            pythonw_path = python_path[:-10] + 'pythonw.exe'
+            if Path(pythonw_path).exists():
+                python_path = pythonw_path
+        script_path = Path(__file__).resolve()
+        return f'"{python_path}" "{script_path}" --silent'
+
+
 def get_autostart_enabled():
-    """التحقق من تفعيل التشغيل التلقائي"""
+    """التحقق من تفعيل التشغيل التلقائي عبر Registry"""
     try:
         key = winreg.OpenKey(
             winreg.HKEY_CURRENT_USER,
@@ -303,8 +320,9 @@ def get_autostart_enabled():
     except Exception:
         return False
 
+
 def set_autostart_enabled(enable: bool):
-    """تفعيل/إلغاء التشغيل التلقائي باستخدام Registry"""
+    """تفعيل/إلغاء التشغيل التلقائي باستخدام Registry فقط (لا يحتاج صلاحيات مسؤول)"""
     try:
         key = winreg.OpenKey(
             winreg.HKEY_CURRENT_USER,
@@ -312,92 +330,68 @@ def set_autostart_enabled(enable: bool):
             0, winreg.KEY_SET_VALUE
         )
         if enable:
-            # استخدام المسار الكامل للتطبيق مع --silent للتشغيل الصامت
-            if getattr(sys, 'frozen', False):
-                # Running as compiled .exe
-                exe_path = f'"{sys.executable}" --silent'
-            else:
-                # Running from Python - use pythonw.exe for headless execution
-                python_path = sys.executable
-                # Convert python.exe to pythonw.exe for no console window
-                if python_path.lower().endswith('python.exe'):
-                    pythonw_path = python_path[:-10] + 'pythonw.exe'
-                    if Path(pythonw_path).exists():
-                        python_path = pythonw_path
-                script_path = Path(__file__).resolve()
-                exe_path = f'"{python_path}" "{script_path}" --silent'
+            exe_path = get_app_launch_command()
             winreg.SetValueEx(key, "Thikr", 0, winreg.REG_SZ, exe_path)
-
-            # Also setup Task Scheduler as backup (more reliable)
-            setup_task_scheduler_autostart(enable=True)
+            log_debug(f"Auto-start enabled with path: {exe_path}")
         else:
             try:
                 winreg.DeleteValue(key, "Thikr")
             except FileNotFoundError:
                 pass
-            # Also remove Task Scheduler task
-            setup_task_scheduler_autostart(enable=False)
+            # Clean up any legacy auto-start methods
+            cleanup_legacy_autostart()
+            log_debug("Auto-start disabled and legacy methods cleaned up")
         winreg.CloseKey(key)
         return True
     except Exception as e:
-        print(f"Autostart error: {e}")
+        log_debug(f"Autostart error: {e}")
         return False
 
 
-def setup_task_scheduler_autostart(enable: bool):
-    """Setup Windows Task Scheduler as backup autostart method (more reliable)"""
-    task_name = "ThikrReminder"
-
+def cleanup_legacy_autostart():
+    """Remove old Task Scheduler tasks and Startup folder .bat files from previous versions"""
+    # Remove Task Scheduler task if it exists
     try:
-        if enable:
-            # Build the command to run with --silent flag
-            if getattr(sys, 'frozen', False):
-                exe_path = sys.executable
-                command = f'"{exe_path}" --silent'
-            else:
-                python_path = sys.executable
-                if python_path.lower().endswith('python.exe'):
-                    pythonw_path = python_path[:-10] + 'pythonw.exe'
-                    if Path(pythonw_path).exists():
-                        python_path = pythonw_path
-                script_path = Path(__file__).resolve()
-                command = f'"{python_path}" "{script_path}" --silent'
+        subprocess.run(
+            ['schtasks', '/Delete', '/TN', 'ThikrReminder', '/F'],
+            capture_output=True,
+            creationflags=subprocess.CREATE_NO_WINDOW
+        )
+    except Exception:
+        pass
 
-            # Delete existing task first (ignore errors)
-            subprocess.run(
-                ['schtasks', '/Delete', '/TN', task_name, '/F'],
-                capture_output=True,
-                creationflags=subprocess.CREATE_NO_WINDOW
-            )
+    # Remove Startup folder .bat files
+    try:
+        startup_path = Path.home() / "AppData" / "Roaming" / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup"
+        for bat_name in ["ذكر.bat", "Thikr.bat"]:
+            bat_file = startup_path / bat_name
+            if bat_file.exists():
+                bat_file.unlink(missing_ok=True)
+                log_debug(f"Removed legacy startup file: {bat_file}")
+    except Exception:
+        pass
 
-            # Create new scheduled task to run at logon with 30 second delay
-            # This runs in user context, no admin required
-            result = subprocess.run(
-                [
-                    'schtasks', '/Create',
-                    '/TN', task_name,
-                    '/TR', command,
-                    '/SC', 'ONLOGON',  # Run at user logon
-                    '/DELAY', '0000:30',  # 30 second delay after logon
-                    '/RL', 'LIMITED',  # Run with limited privileges (user level)
-                    '/F'  # Force overwrite if exists
-                ],
-                capture_output=True,
-                text=True,
-                creationflags=subprocess.CREATE_NO_WINDOW
-            )
-            return result.returncode == 0
-        else:
-            # Delete the scheduled task
-            result = subprocess.run(
-                ['schtasks', '/Delete', '/TN', task_name, '/F'],
-                capture_output=True,
-                creationflags=subprocess.CREATE_NO_WINDOW
-            )
-            return True
+
+def verify_and_fix_autostart_path():
+    """If auto-start is enabled, ensure the registry points to the current .exe location.
+    Handles cases where the user moved the app folder after installation."""
+    if not get_autostart_enabled():
+        return
+    try:
+        key = winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Run",
+            0, winreg.KEY_READ
+        )
+        stored_path, _ = winreg.QueryValueEx(key, "Thikr")
+        winreg.CloseKey(key)
+
+        expected_path = get_app_launch_command()
+        if stored_path != expected_path:
+            set_autostart_enabled(True)  # Re-register with current path
+            log_debug(f"Updated autostart path from '{stored_path}' to '{expected_path}'")
     except Exception as e:
-        print(f"Task Scheduler error: {e}")
-        return False
+        log_debug(f"verify_and_fix_autostart_path error: {e}")
 
 
 # ============================================
@@ -2025,35 +2019,10 @@ class SettingsWindow(QMainWindow):
         popup = ReminderPopup(self.settings)
         popup.show_thikr({'text': 'سُبْحَانَ اللَّهِ وَبِحَمْدِهِ', 'virtue': 'كلمتان خفيفتان على اللسان'})
     
-    def get_startup_path(self):
-        """الحصول على مسار مجلد Startup في Windows"""
-        if sys.platform == 'win32':
-            import winreg
-            try:
-                key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
-                    r"Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders")
-                startup_path = winreg.QueryValueEx(key, "Startup")[0]
-                winreg.CloseKey(key)
-                return Path(startup_path)
-            except:
-                # مسار بديل
-                return Path.home() / "AppData" / "Roaming" / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup"
-        return None
-    
-    def get_shortcut_path(self):
-        """الحصول على مسار ملف الاختصار"""
-        startup = self.get_startup_path()
-        if startup:
-            return startup / "ذكر.bat"
-        return None
-    
     def is_autostart_enabled(self):
-        """التحقق من تفعيل التشغيل التلقائي"""
-        shortcut = self.get_shortcut_path()
-        if shortcut:
-            return shortcut.exists()
-        return False
-    
+        """التحقق من تفعيل التشغيل التلقائي عبر Registry"""
+        return get_autostart_enabled()
+
     def update_autostart_status(self):
         """تحديث حالة التشغيل التلقائي"""
         if self.is_autostart_enabled():
@@ -2064,42 +2033,19 @@ class SettingsWindow(QMainWindow):
             self.autostart_cb.setChecked(False)
             self.autostart_status.setText("❌ غير مفعّل")
             self.autostart_status.setStyleSheet("color: #ff6b6b;")
-    
+
     def set_autostart(self, enable):
-        """تفعيل أو إلغاء التشغيل التلقائي"""
-        if sys.platform != 'win32':
-            QMessageBox.warning(self, "تنبيه", "هذه الميزة متاحة فقط على Windows")
-            return
-        
-        shortcut_path = self.get_shortcut_path()
-        if not shortcut_path:
-            return
-        
-        if enable:
-            # إنشاء ملف BAT للتشغيل
-            app_path = Path(__file__).parent.resolve()
-            bat_content = f'''@echo off
-chcp 65001 >nul
-cd /d "{app_path}"
-start "" pythonw thikr.py
-exit
-'''
-            try:
-                with open(shortcut_path, 'w', encoding='utf-8') as f:
-                    f.write(bat_content)
+        """تفعيل أو إلغاء التشغيل التلقائي عبر Registry"""
+        success = set_autostart_enabled(enable)
+        if success:
+            if enable:
                 self.autostart_status.setText("✅ تم التفعيل!")
                 self.autostart_status.setStyleSheet("color: #00ff88;")
-            except Exception as e:
-                QMessageBox.warning(self, "خطأ", f"فشل تفعيل التشغيل التلقائي:\n{e}")
-        else:
-            # حذف ملف الاختصار
-            try:
-                if shortcut_path.exists():
-                    shortcut_path.unlink()
+            else:
                 self.autostart_status.setText("❌ تم الإلغاء")
                 self.autostart_status.setStyleSheet("color: #ff6b6b;")
-            except Exception as e:
-                QMessageBox.warning(self, "خطأ", f"فشل إلغاء التشغيل التلقائي:\n{e}")
+        else:
+            QMessageBox.warning(self, "خطأ", "فشل تغيير إعداد التشغيل التلقائي")
     
     def apply_style(self):
         t = self.settings.get_theme()
@@ -2721,6 +2667,13 @@ def main():
         log_debug(f"Settings file: {settings.settings_file}")
         log_debug(f"Settings file exists: {settings.settings_file.exists()}")
         log_debug(f"first_run_complete value: {settings.get('first_run_complete', False)}")
+
+        # Clean up legacy auto-start methods (Task Scheduler, Startup .bat) from older versions
+        cleanup_legacy_autostart()
+
+        # If auto-start is enabled, verify the registry path matches current .exe location
+        # This handles the case where the user moved the app folder
+        verify_and_fix_autostart_path()
 
         # التحقق إذا كان التشغيل الأول
         if not settings.get('first_run_complete', False):
