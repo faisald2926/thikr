@@ -285,6 +285,124 @@ def get_now(tz_string="UTC+3"):
 # وظائف التشغيل التلقائي (Windows Registry)
 # ============================================
 
+def is_volatile_location(path):
+    """True if `path` lives in a temp / archive-viewer / recycle-bin folder
+    that won't reliably survive a reboot or a Windows cleanup pass.
+
+    Catches the common 'user double-clicked the .exe from inside the .zip/.rar
+    instead of extracting first' case — those launches run from
+    `%TEMP%\\Rar$EX...`, `%TEMP%\\7zE...`, `%TEMP%\\Temp1_*`, etc., and any
+    autostart entry pointing there breaks the moment that temp folder is gone.
+    """
+    try:
+        p = str(Path(path).resolve()).lower()
+    except Exception:
+        return False
+
+    candidates = []
+    for env_var in ('TEMP', 'TMP'):
+        v = os.environ.get(env_var)
+        if v:
+            try:
+                candidates.append(str(Path(v).resolve()).lower())
+            except Exception:
+                pass
+    try:
+        candidates.append(str((Path.home() / 'AppData' / 'Local' / 'Temp').resolve()).lower())
+    except Exception:
+        pass
+
+    for c in candidates:
+        if c and p.startswith(c):
+            return True
+
+    parent_name = Path(p).parent.name.lower()
+    archive_tags = ('rar$ex', 'temp1_', 'temp2_', 'temp3_', 'temp4_', '7ze', '.tmp')
+    if any(tag in parent_name for tag in archive_tags):
+        return True
+
+    if '$recycle.bin' in p:
+        return True
+
+    return False
+
+
+def get_stable_install_dir():
+    """Per-user stable install location for the .exe. Survives reboots,
+    needs no admin, and is preserved across Storage Sense / Disk Cleanup."""
+    base = os.environ.get('LOCALAPPDATA')
+    if not base:
+        base = str(Path.home() / 'AppData' / 'Local')
+    return Path(base) / 'Thikr'
+
+
+def ensure_installed_in_stable_location():
+    """If the compiled .exe is currently running from a volatile location
+    (a temp folder, an archive-viewer extraction folder, the recycle bin),
+    copy ourselves to `%LOCALAPPDATA%\\Thikr\\Thikr.exe` and relaunch from
+    there. Returns True if the caller should exit immediately because the
+    stable copy was launched.
+
+    This is the single most important fix for 'works at first, then stops
+    after a reboot' — autostart must point at a path that won't disappear.
+    """
+    if not getattr(sys, 'frozen', False):
+        return False  # Source / dev runs aren't affected
+    try:
+        current_exe = Path(sys.executable).resolve()
+    except Exception:
+        return False
+    if not is_volatile_location(current_exe):
+        return False
+
+    try:
+        stable_dir = get_stable_install_dir()
+        stable_dir.mkdir(parents=True, exist_ok=True)
+        stable_exe = stable_dir / 'Thikr.exe'
+
+        need_copy = True
+        if stable_exe.exists():
+            try:
+                same_size = stable_exe.stat().st_size == current_exe.stat().st_size
+                same_mtime = abs(stable_exe.stat().st_mtime - current_exe.stat().st_mtime) < 2
+                need_copy = not (same_size and same_mtime)
+            except Exception:
+                need_copy = True
+
+        if need_copy:
+            import shutil
+            tmp_target = stable_exe.with_suffix('.exe.new')
+            shutil.copy2(str(current_exe), str(tmp_target))
+            try:
+                if stable_exe.exists():
+                    stable_exe.unlink()
+            except Exception:
+                pass
+            try:
+                tmp_target.replace(stable_exe)
+            except Exception:
+                shutil.copy2(str(tmp_target), str(stable_exe))
+                try:
+                    tmp_target.unlink()
+                except Exception:
+                    pass
+            log_debug(f"Copied Thikr.exe to stable install dir: {stable_exe}")
+
+        args = [str(stable_exe)] + sys.argv[1:]
+        DETACHED_PROCESS = 0x00000008
+        CREATE_NEW_PROCESS_GROUP = 0x00000200
+        subprocess.Popen(
+            args,
+            close_fds=True,
+            creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
+        )
+        log_debug(f"Relaunched from stable install dir: {stable_exe}")
+        return True
+    except Exception as e:
+        log_debug(f"ensure_installed_in_stable_location failed: {e}")
+        return False
+
+
 def get_app_launch_command():
     """Get the command to launch this app at startup, works for both .exe and source."""
     if getattr(sys, 'frozen', False):
@@ -330,6 +448,15 @@ def set_autostart_enabled(enable: bool):
             0, winreg.KEY_SET_VALUE
         )
         if enable:
+            # Safety: never register a volatile path (temp/archive folder) —
+            # it would silently break on the next reboot or cleanup.
+            if getattr(sys, 'frozen', False) and is_volatile_location(sys.executable):
+                log_debug(
+                    f"Refusing to register volatile autostart path: {sys.executable}. "
+                    f"The .exe should have been migrated to a stable location first."
+                )
+                winreg.CloseKey(key)
+                return False
             exe_path = get_app_launch_command()
             winreg.SetValueEx(key, "Thikr", 0, winreg.REG_SZ, exe_path)
             log_debug(f"Auto-start enabled with path: {exe_path}")
@@ -372,9 +499,33 @@ def cleanup_legacy_autostart():
         pass
 
 
+def _extract_exe_from_run_command(cmd):
+    """Pull just the executable path out of a Run-key command string like
+    `"C:\\path\\Thikr.exe" --silent`. Returns None if it can't be parsed."""
+    if not cmd:
+        return None
+    s = cmd.strip()
+    if s.startswith('"'):
+        end = s.find('"', 1)
+        if end > 0:
+            return s[1:end]
+        return None
+    # Unquoted: take everything up to the first space
+    return s.split(' ', 1)[0]
+
+
 def verify_and_fix_autostart_path():
     """If auto-start is enabled, ensure the registry points to the current .exe location.
-    Handles cases where the user moved the app folder after installation."""
+
+    Re-registers in three cases:
+      1. The stored command no longer matches the current launch command
+         (e.g. the user moved the install folder).
+      2. The stored exe path no longer exists on disk — this is the
+         'temp folder got cleaned' / 'install folder got deleted' case
+         that caused silent failures on reboot.
+      3. The stored path points to a volatile temp/archive location; rewrite
+         it to the current stable path.
+    """
     if not get_autostart_enabled():
         return
     try:
@@ -387,7 +538,18 @@ def verify_and_fix_autostart_path():
         winreg.CloseKey(key)
 
         expected_path = get_app_launch_command()
-        if stored_path != expected_path:
+        stored_exe = _extract_exe_from_run_command(stored_path)
+
+        needs_update = (stored_path != expected_path)
+        if stored_exe:
+            if not Path(stored_exe).exists():
+                log_debug(f"Stored autostart exe is missing on disk: {stored_exe}")
+                needs_update = True
+            elif is_volatile_location(stored_exe):
+                log_debug(f"Stored autostart exe is in a volatile location: {stored_exe}")
+                needs_update = True
+
+        if needs_update:
             set_autostart_enabled(True)  # Re-register with current path
             log_debug(f"Updated autostart path from '{stored_path}' to '{expected_path}'")
     except Exception as e:
@@ -2644,6 +2806,13 @@ def main():
         # دعم التجميد للتطبيقات المجمعة (PyInstaller)
         import multiprocessing
         multiprocessing.freeze_support()
+
+        # If the user double-clicked Thikr.exe from inside a .zip/.rar/temp
+        # location, copy ourselves to %LOCALAPPDATA%\Thikr first and relaunch
+        # from there. This must happen BEFORE the single-instance lock so the
+        # stable copy is the one that acquires the lock and registers autostart.
+        if ensure_installed_in_stable_location():
+            sys.exit(0)
 
         # Check for --silent flag (used by autostart)
         silent_mode = '--silent' in sys.argv or '-s' in sys.argv
